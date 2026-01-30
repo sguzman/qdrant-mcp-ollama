@@ -4,7 +4,7 @@ import json
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastmcp import FastMCP
@@ -17,14 +17,15 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qllama/bge-small-en-v1.5")
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "chunkr_test")
 QDRANT_DISTANCE = os.getenv(
     "QDRANT_DISTANCE", "Cosine"
 )  # Cosine / Dot / Euclid / Manhattan
 
 DEFAULT_TOP_K = int(os.getenv("TOP_K", "8"))
-DEFAULT_MAX_ROWS = int(os.getenv("MAX_ROWS", "50"))
 TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "30"))
+
+# Optional: default collection if caller doesn't specify one.
+DEFAULT_COLLECTION = os.getenv("QDRANT_DEFAULT_COLLECTION", "")
 
 
 # -------------------------
@@ -42,10 +43,21 @@ def _qdrant_headers() -> Dict[str, str]:
     return h
 
 
+def _require_collection(collection: Optional[str]) -> str:
+    c = (collection or "").strip()
+    if c:
+        return c
+    if DEFAULT_COLLECTION.strip():
+        return DEFAULT_COLLECTION.strip()
+    raise ValueError("collection is required (or set QDRANT_DEFAULT_COLLECTION)")
+
+
 def _ollama_embed(texts: List[str]) -> List[List[float]]:
     """
-    Ollama embeddings: POST /api/embed  { model, input }
-    Returns: embeddings: number[][]
+    Ollama embeddings endpoint:
+      POST /api/embed  { model, input }
+    Returns:
+      { embeddings: number[][], ... }
     """
     url = f"{OLLAMA_URL.rstrip('/')}/api/embed"
     body = {"model": OLLAMA_MODEL, "input": texts}
@@ -56,14 +68,22 @@ def _ollama_embed(texts: List[str]) -> List[List[float]]:
     emb = data.get("embeddings")
     if not isinstance(emb, list) or not emb:
         raise RuntimeError(f"Ollama /api/embed returned no embeddings: {data}")
-    # emb is list[list[float]]
     return emb
 
 
-def _qdrant_collection_exists(name: str) -> bool:
+def _qdrant_collection_info(name: str) -> Tuple[bool, Optional[int]]:
+    """Return (exists, vector_size_if_known)."""
     url = f"{QDRANT_URL.rstrip('/')}/collections/{name}"
     r = requests.get(url, headers=_qdrant_headers(), timeout=TIMEOUT_S)
-    return r.status_code == 200
+    if r.status_code != 200:
+        return (False, None)
+    data = r.json()
+    # Qdrant returns something like: {"result":{"config":{"params":{"vectors":{"size":...}}}}}
+    try:
+        size = data["result"]["config"]["params"]["vectors"]["size"]
+        return (True, int(size))
+    except Exception:
+        return (True, None)
 
 
 def _qdrant_create_collection(name: str, vector_size: int) -> None:
@@ -79,30 +99,39 @@ def _qdrant_create_collection(name: str, vector_size: int) -> None:
     r.raise_for_status()
 
 
-def _qdrant_ensure_collection(vector_size: int) -> None:
-    if _qdrant_collection_exists(QDRANT_COLLECTION):
+def _qdrant_ensure_collection(name: str, vector_size: int) -> None:
+    exists, existing_size = _qdrant_collection_info(name)
+    if not exists:
+        _qdrant_create_collection(name, vector_size)
         return
-    _qdrant_create_collection(QDRANT_COLLECTION, vector_size)
+    if existing_size is not None and existing_size != vector_size:
+        raise RuntimeError(
+            f"Collection '{name}' exists with vector size {existing_size}, "
+            f"but current embedding model outputs size {vector_size}. "
+            f"Use a different collection or recreate it."
+        )
 
 
-def _qdrant_upsert(points: List[Dict[str, Any]]) -> Dict[str, Any]:
-    url = f"{QDRANT_URL.rstrip('/')}/collections/{QDRANT_COLLECTION}/points?wait=true"
+def _qdrant_upsert(collection: str, points: List[Dict[str, Any]]) -> Dict[str, Any]:
+    url = f"{QDRANT_URL.rstrip('/')}/collections/{collection}/points?wait=true"
     body = {"points": points}
-    _log("qdrant.points.upsert", collection=QDRANT_COLLECTION, n=len(points))
+    _log("qdrant.points.upsert", collection=collection, n=len(points))
     r = requests.put(url, headers=_qdrant_headers(), json=body, timeout=TIMEOUT_S)
     r.raise_for_status()
     return r.json()
 
 
-def _qdrant_search(query_vector: List[float], limit: int) -> Dict[str, Any]:
-    url = f"{QDRANT_URL.rstrip('/')}/collections/{QDRANT_COLLECTION}/points/search"
+def _qdrant_search(
+    collection: str, query_vector: List[float], limit: int
+) -> Dict[str, Any]:
+    url = f"{QDRANT_URL.rstrip('/')}/collections/{collection}/points/search"
     body = {
         "vector": query_vector,
         "limit": limit,
         "with_payload": True,
         "with_vector": False,
     }
-    _log("qdrant.points.search", collection=QDRANT_COLLECTION, limit=limit)
+    _log("qdrant.points.search", collection=collection, limit=limit)
     r = requests.post(url, headers=_qdrant_headers(), json=body, timeout=TIMEOUT_S)
     r.raise_for_status()
     return r.json()
@@ -124,14 +153,18 @@ def embed_text(text: str) -> Dict[str, Any]:
 @mcp.tool
 def upsert_texts(
     texts: List[str],
+    collection: Optional[str] = None,
     ids: Optional[List[str]] = None,
     metadatas: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Embed texts with Ollama and upsert into Qdrant.
-    - texts: list of strings
-    - ids: optional list of point ids (strings). If not provided, UUIDs are generated.
-    - metadatas: optional list of payload dicts, same length as texts
+
+    Args:
+      texts: list of strings
+      collection: qdrant collection name (optional if QDRANT_DEFAULT_COLLECTION is set)
+      ids: optional list of point ids (strings). If not provided, UUIDs are generated.
+      metadatas: optional list of payload dicts, same length as texts
     """
     if not texts:
         return {"ok": True, "upserted": 0}
@@ -141,9 +174,11 @@ def upsert_texts(
     if metadatas is not None and len(metadatas) != len(texts):
         raise ValueError("metadatas must be same length as texts (or omitted)")
 
+    c = _require_collection(collection)
+
     embs = _ollama_embed(texts)
     vector_size = len(embs[0])
-    _qdrant_ensure_collection(vector_size)
+    _qdrant_ensure_collection(c, vector_size)
 
     points: List[Dict[str, Any]] = []
     for i, (t, v) in enumerate(zip(texts, embs)):
@@ -154,22 +189,23 @@ def upsert_texts(
         }
         points.append({"id": pid, "vector": v, "payload": payload})
 
-    res = _qdrant_upsert(points)
-    return {
-        "ok": True,
-        "collection": QDRANT_COLLECTION,
-        "upserted": len(points),
-        "result": res,
-    }
+    res = _qdrant_upsert(c, points)
+    return {"ok": True, "collection": c, "upserted": len(points), "result": res}
 
 
 @mcp.tool
-def search_text(query: str, top_k: int = DEFAULT_TOP_K) -> Dict[str, Any]:
+def search_text(
+    query: str,
+    collection: Optional[str] = None,
+    top_k: int = DEFAULT_TOP_K,
+) -> Dict[str, Any]:
     """Embed query with Ollama and run Qdrant vector search."""
+    c = _require_collection(collection)
+
     vec = _ollama_embed([query])[0]
-    _qdrant_ensure_collection(len(vec))
-    res = _qdrant_search(vec, int(top_k))
-    return {"ok": True, "collection": QDRANT_COLLECTION, "top_k": top_k, "result": res}
+    _qdrant_ensure_collection(c, len(vec))
+    res = _qdrant_search(c, vec, int(top_k))
+    return {"ok": True, "collection": c, "top_k": int(top_k), "result": res}
 
 
 if __name__ == "__main__":
@@ -178,6 +214,6 @@ if __name__ == "__main__":
         ollama_url=OLLAMA_URL,
         ollama_model=OLLAMA_MODEL,
         qdrant_url=QDRANT_URL,
-        collection=QDRANT_COLLECTION,
+        default_collection=DEFAULT_COLLECTION,
     )
     mcp.run()
